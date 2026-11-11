@@ -1,0 +1,11 @@
+{
+  "run_name": "gsm8k-boxed-sft-final",
+  "model_path": "trio://run_dx75o93uk5ch/sampler_weights/gsm8k-boxed-sft-final-weights",
+  "num_examples": 1319,
+  "accuracy": 0.8498862774829417,
+  "format_rate": 0.9984836997725549,
+  "num_correct": 1121,
+  "num_format_ok": 1317,
+  "num_hit_max_tokens": 2,
+  "avg_output_tokens": 99.62471569370736
+}

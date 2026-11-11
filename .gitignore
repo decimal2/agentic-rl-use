@@ -238,6 +238,7 @@ __marimo__/
 .DS_Store
 
 # Local dataset downloads
+database/
 experiments/medical-opd/datasets/
 experiments/medical-opd/eval-results/
 experiments/opsd/datasets/
