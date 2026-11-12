@@ -23,6 +23,12 @@ nohup 示例：
         > experiments/trio-use/opd.log 2>&1 &
     echo $! > experiments/trio-use/opd.pid
 
+每 100 步（--save-every，默认 100）保存一次 state + sampler 权重；中断后可从最近的
+``-state`` 继续训练（step 计数重新从 0 开始，建议换一个 --save-name 避免 checkpoint 重名）：
+    uv run python experiments/trio-use/qwen_3p5_4b_lora_opd_27b.py \
+        --resume-from 'trio://RUN_ID/weights/gsm8k-opd-27b-step-100-state' \
+        --save-name gsm8k-opd-27b-v2
+
 训练完成后用 SFT 脚本评测（会同时输出 base 和 OPD checkpoint）：
     uv run python experiments/trio-use/qwen_3p5_4b_lora_sft.py --eval-only \
         --save-name gsm8k-opd-27b-final \
@@ -94,10 +100,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-every",
         type=int,
-        default=50,
-        help="每多少 step 保存一次 state + sampler 权重；0 表示只在结束时保存",
+        default=100,
+        help="每多少 step 保存一次可续训 state + sampler 权重；0 表示只在结束时保存",
     )
     parser.add_argument("--save-name", default="gsm8k-opd-27b")
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="从 save_state 的 checkpoint URI 继续训练（恢复权重和 optimizer；"
+        "base model 和 rank 以 checkpoint 元数据为准，step 计数重新从 0 开始）",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-file", default=str(DEFAULT_TRAIN_FILE))
     parser.add_argument(
@@ -460,6 +472,9 @@ def ensure_models_available(
     capabilities = service_client.get_server_capabilities()
     models = {model.model_name: model for model in capabilities.supported_models}
     for role, model_name in (("student", student_model), ("teacher", teacher_model)):
+        # resume 时 student 的 base model 由 checkpoint 元数据决定，这里只检查 teacher。
+        if model_name is None:
+            continue
         model = models.get(model_name)
         if model is None:
             raise ValueError(
@@ -522,14 +537,20 @@ def main() -> None:
         service_client = trio.ServiceClient()
         ensure_models_available(
             service_client,
-            student_model=args.base_model,
+            student_model=None if args.resume_from else args.base_model,
             teacher_model=args.teacher_base_model,
         )
-        training_client = service_client.create_lora_training_client(
-            base_model=args.base_model,
-            rank=args.rank,
-            seed=args.seed,
-        )
+        if args.resume_from:
+            print(f"Resuming student from state: {args.resume_from}")
+            training_client = service_client.create_training_client_from_state_with_optimizer(
+                args.resume_from
+            )
+        else:
+            training_client = service_client.create_lora_training_client(
+                base_model=args.base_model,
+                rank=args.rank,
+                seed=args.seed,
+            )
         teacher_client = service_client.create_sampling_client(
             base_model=args.teacher_base_model,
             model_path=args.teacher_model_path,
@@ -547,7 +568,10 @@ def main() -> None:
                 "Teacher and student tokenizers disagree; token ids cannot be aligned"
             )
 
-        print(f"Student: {args.base_model} (LoRA rank {args.rank})")
+        if args.resume_from:
+            print(f"Student: resumed from {args.resume_from}")
+        else:
+            print(f"Student: {args.base_model} (LoRA rank {args.rank})")
         print(
             f"Teacher: {args.teacher_base_model}"
             + (
