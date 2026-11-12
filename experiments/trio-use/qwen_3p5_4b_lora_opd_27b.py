@@ -19,14 +19,16 @@
 
 nohup 示例：
     PYTHONUNBUFFERED=1 nohup uv run python experiments/trio-use/qwen_3p5_4b_lora_opd_27b.py \
-        --batch-size 8 --group-size 4 --save-name gsm8k-opd-27b \
+        --batch-size 16 --group-size 1 --save-name gsm8k-opd-27b \
         > experiments/trio-use/opd.log 2>&1 &
     echo $! > experiments/trio-use/opd.pid
 
 每 100 步（--save-every，默认 100）保存一次 state + sampler 权重；中断后可从最近的
 ``-state`` 继续训练（step 计数重新从 0 开始，建议换一个 --save-name 避免 checkpoint 重名）：
     uv run python experiments/trio-use/qwen_3p5_4b_lora_opd_27b.py \
-        --resume-from 'trio://RUN_ID/weights/gsm8k-opd-27b-step-100-state' \
+        --batch_size 16 \
+        --group-size 1 \
+        --resume-from 'trio://run_wnb1bhqkm0f5/weights/gsm8k-opd-27b-step-200-state' \
         --save-name gsm8k-opd-27b-v2
 
 训练完成后用 SFT 脚本评测（会同时输出 base 和 OPD checkpoint）：
