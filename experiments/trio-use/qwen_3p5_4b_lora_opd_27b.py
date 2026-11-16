@@ -9,8 +9,10 @@
     student 采样 completion + old logprob
         -> teacher 对同一串 prompt + completion 计算 logprob
         -> reverse_kl = student_lp - teacher_lp
-        -> advantage = -kl_penalty_coef * reverse_kl
+        -> advantage = -reverse_kl
         -> importance_sampling Datum -> forward_backward -> optim_step
+
+固定使用 temperature=1、无 top-p/top-k 截断，并在每步更新前刷新 student sampler。
 
 运行（从仓库根目录）：
     uv run python experiments/trio-use/qwen_3p5_4b_lora_opd_27b.py --dry-run
@@ -23,13 +25,21 @@ nohup 示例：
         > experiments/trio-use/opd.log 2>&1 &
     echo $! > experiments/trio-use/opd.pid
 
-每 100 步（--save-every，默认 100）保存一次 state + sampler 权重；中断后可从最近的
-``-state`` 继续训练（step 计数重新从 0 开始，建议换一个 --save-name 避免 checkpoint 重名）：
-    uv run python experiments/trio-use/qwen_3p5_4b_lora_opd_27b.py \
-        --batch_size 16 \
+每 100 步（--save-every，默认 100）保存一次 state + sampler 权重，并在本地
+``experiments/trio-use/checkpoints/`` 写入同名 JSON 元数据（step、data_offset、
+batch_size、seed、数据集指纹）。续训时自动读取元数据，从断点对应的数据和全局
+step 继续：
+    PYTHONUNBUFFERED=1 nohup uv run python experiments/trio-use/qwen_3p5_4b_lora_opd_27b.py \
+        --batch-size 16 \
         --group-size 1 \
-        --resume-from 'trio://run_wnb1bhqkm0f5/weights/gsm8k-opd-27b-step-200-state' \
-        --save-name gsm8k-opd-27b-v2
+        --resume-from 'trio://run_6rfsab589psb/weights/gsm8k-opd-27b-step-300-state' \
+        --max-steps 468 \
+        --save-name gsm8k-opd-27b-v2 > experiments/trio-use/opd-v2.log 2>&1 & 
+    echo $! > experiments/trio-use/opd-v2.pid
+
+``--max-steps`` 是全局 step 上限；0 表示跑到本 epoch 数据结束。没有元数据的旧
+checkpoint 会用 ``--resume-step`` 或 checkpoint 名里的 step 推算数据偏移。
+若训练更新已提交但结果未确认就中断，不保存未知状态；请从最近的可靠 checkpoint 续训。
 
 训练完成后用 SFT 脚本评测（会同时输出 base 和 OPD checkpoint）：
     uv run python experiments/trio-use/qwen_3p5_4b_lora_sft.py --eval-only \
@@ -38,14 +48,18 @@ nohup 示例：
 """
 
 import argparse
+import hashlib
+import json
 import random
+import re
 import signal
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from datasets import load_dataset
 import numpy as np
 import pytrio as trio
+from datasets import load_dataset
 from tqdm import tqdm
 
 # teacher 打 logprob 是额外的远程请求，给请求超时留足余量。
@@ -54,25 +68,41 @@ trio.configure(request_timeout_seconds=600)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TRAIN_FILE = REPO_ROOT / "database/gsm8k/main/train-*.parquet"
 QUESTION_SUFFIX = " Provide a numerical answer without units, written inside \\boxed{}."
+CHECKPOINTS_DIR = REPO_ROOT / "experiments/trio-use/checkpoints"
+RESUME_STEP_RE = re.compile(r"-step-(\d+)-state$")
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """本次运行的全局 step 和数据游标。"""
+
+    resume_step: int
+    data_offset: int
+    steps_to_run: int
+    questions_sha256: str
+    metadata_found: bool
+
+    @property
+    def end_step(self) -> int:
+        return self.resume_step + self.steps_to_run
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="GSM8K OPD: Qwen3.5-4B LoRA student <- Qwen3.8-27B teacher"
     )
-    parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B", help="student 基础模型")
+    parser.add_argument(
+        "--base-model", default="Qwen/Qwen3.5-4B", help="student 基础模型"
+    )
     parser.add_argument(
         "--teacher-base-model",
         default="Qwen/Qwen3.8-27B",
         help="teacher 基础模型；必须和 student 使用同一 tokenizer",
     )
-    parser.add_argument(
-        "--teacher-model-path",
-        default=None,
-        help="可选：用已训练的 sampler 权重当 teacher；不传则用 teacher base model",
-    )
     parser.add_argument("--rank", type=int, default=32, help="student LoRA rank")
-    parser.add_argument("--batch-size", type=int, default=8, help="每个 step 的 prompt 数")
+    parser.add_argument(
+        "--batch-size", type=int, default=8, help="每个 step 的 prompt 数"
+    )
     parser.add_argument(
         "--group-size",
         type=int,
@@ -83,22 +113,12 @@ def parse_args() -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=0,
-        help="最多跑多少 step；0 表示跑满一个 epoch",
+        help="跑到全局第多少 step 为止；0 表示跑到本 epoch 数据结束",
     )
-    parser.add_argument("--max-tokens", type=int, default=512, help="每条 completion 的 token 上限")
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=-1)
-    parser.add_argument("--kl-penalty-coef", type=float, default=1.0, help="reverse KL advantage 系数")
-    parser.add_argument("--learning-rate", type=float, default=4e-5)
-    parser.add_argument("--beta1", type=float, default=0.9)
-    parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument(
-        "--sampler-refresh-steps",
-        type=int,
-        default=1,
-        help="每隔多少 step 用最新 student 权重刷新 sampler",
+        "--max-tokens", type=int, default=512, help="每条 completion 的 token 上限"
     )
+    parser.add_argument("--learning-rate", type=float, default=4e-5)
     parser.add_argument(
         "--save-every",
         type=int,
@@ -109,8 +129,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-from",
         default=None,
-        help="从 save_state 的 checkpoint URI 继续训练（恢复权重和 optimizer；"
-        "base model 和 rank 以 checkpoint 元数据为准，step 计数重新从 0 开始）",
+        help="从 save_state 的 checkpoint URI 继续训练（恢复权重和 optimizer）",
+    )
+    parser.add_argument(
+        "--resume-step",
+        type=int,
+        default=None,
+        help="断点已完成 step 数；不传时优先读本地元数据，其次从 checkpoint 名解析",
+    )
+    parser.add_argument(
+        "--skip-prompts",
+        type=int,
+        default=None,
+        help="直接指定数据偏移；用于断点 batch_size 与当前不一致的情况",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-file", default=str(DEFAULT_TRAIN_FILE))
@@ -120,12 +151,6 @@ def parse_args() -> argparse.Namespace:
         help="只统计 prompt/step/rollout 数，不连接 PyTRIO",
     )
     parser.add_argument("--swanlab", action="store_true", help="启用 SwanLab 记录")
-    parser.add_argument("--swanlab-project", default="agentic-rl-lab-opd")
-    parser.add_argument(
-        "--swanlab-mode",
-        choices=["online", "local", "offline", "disabled"],
-        default=None,
-    )
     args = parser.parse_args()
 
     if args.batch_size <= 0:
@@ -136,12 +161,16 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-steps must be >= 0")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be > 0")
-    if args.sampler_refresh_steps <= 0:
-        raise ValueError("--sampler-refresh-steps must be > 0")
     if args.save_every < 0:
         raise ValueError("--save-every must be >= 0")
-    if args.kl_penalty_coef <= 0:
-        raise ValueError("--kl-penalty-coef must be > 0")
+    if args.resume_step is not None and args.resume_step < 0:
+        raise ValueError("--resume-step must be >= 0")
+    if args.skip_prompts is not None and args.skip_prompts < 0:
+        raise ValueError("--skip-prompts must be >= 0")
+    if not args.resume_from and (
+        args.resume_step is not None or args.skip_prompts is not None
+    ):
+        raise ValueError("--resume-step/--skip-prompts require --resume-from")
     return args
 
 
@@ -152,6 +181,139 @@ def load_gsm8k_questions(path: str) -> list[str]:
     if not questions:
         raise ValueError(f"No questions loaded from {path}")
     return questions
+
+
+def sha256_of_questions(questions: list[str]) -> str:
+    """对打乱后的 question 列表做指纹，用于 resume 时校验数据顺序。"""
+    return hashlib.sha256("\n".join(questions).encode("utf-8")).hexdigest()
+
+
+def parse_step_from_uri(uri: str) -> int | None:
+    match = RESUME_STEP_RE.search(uri.rstrip("/"))
+    return int(match.group(1)) if match else None
+
+
+def find_checkpoint_metadata(state_uri: str) -> dict | None:
+    """按 state URI 查找本地 checkpoint 元数据。"""
+    matches = []
+    for path in CHECKPOINTS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("state_uri") == state_uri:
+            matches.append(data)
+    if len(matches) > 1:
+        raise ValueError(f"Multiple checkpoint metadata files match {state_uri}")
+    return matches[0] if matches else None
+
+
+def resolve_run_plan(
+    args: argparse.Namespace,
+    questions: list[str],
+    questions_sha256: str,
+) -> RunPlan:
+    """解析 resume step 和数据偏移，返回本次运行的全局 step 范围。"""
+    num_questions = len(questions)
+    metadata_found = False
+
+    if not args.resume_from:
+        resume_step = 0
+        data_offset = 0
+    else:
+        metadata = find_checkpoint_metadata(args.resume_from)
+        if metadata is not None:
+            metadata_found = True
+            resume_step = int(metadata["checkpoint_step"])
+            if args.resume_step is not None and args.resume_step != resume_step:
+                raise ValueError(
+                    f"--resume-step {args.resume_step} does not match checkpoint "
+                    f"metadata step {resume_step}"
+                )
+            for key, current in (
+                ("seed", args.seed),
+                ("num_questions", num_questions),
+                ("questions_sha256", questions_sha256),
+            ):
+                if metadata.get(key) != current:
+                    raise ValueError(
+                        f"Checkpoint {key}={metadata.get(key)!r} does not match "
+                        f"current {current!r}; use the original dataset and --seed"
+                    )
+            data_offset = int(metadata["data_offset"])
+        else:
+            resume_step = args.resume_step
+            if resume_step is None:
+                resume_step = parse_step_from_uri(args.resume_from)
+            if resume_step is None:
+                raise ValueError(
+                    f"No checkpoint metadata for {args.resume_from} and cannot parse "
+                    "a step number from its name; pass --resume-step"
+                )
+            data_offset = resume_step * args.batch_size
+
+        if args.skip_prompts is not None:
+            data_offset = args.skip_prompts
+        if metadata is not None and metadata.get("batch_size") != args.batch_size:
+            print(
+                f"Warning: checkpoint batch_size={metadata.get('batch_size')}; "
+                f"continuing with {args.batch_size} from data_offset={data_offset}"
+            )
+
+    if not 0 <= data_offset < num_questions:
+        raise ValueError(
+            f"data_offset {data_offset} is outside [0, {num_questions}); "
+            "the epoch is already finished or the offset is invalid"
+        )
+
+    remaining_steps = (
+        num_questions - data_offset + args.batch_size - 1
+    ) // args.batch_size
+    if args.max_steps and args.max_steps <= resume_step:
+        raise ValueError(
+            f"--max-steps {args.max_steps} must exceed resume step {resume_step}"
+        )
+    steps_to_run = (
+        min(args.max_steps - resume_step, remaining_steps)
+        if args.max_steps
+        else remaining_steps
+    )
+    end_step = resume_step + steps_to_run
+    if args.max_steps > end_step:
+        print(
+            f"--max-steps {args.max_steps} is beyond the epoch end; "
+            f"stopping at global step {end_step}"
+        )
+    return RunPlan(
+        resume_step=resume_step,
+        data_offset=data_offset,
+        steps_to_run=steps_to_run,
+        questions_sha256=questions_sha256,
+        metadata_found=metadata_found,
+    )
+
+
+def build_checkpoint_metadata(
+    args: argparse.Namespace,
+    plan: RunPlan,
+    num_questions: int,
+    global_step: int,
+) -> dict:
+    """生成写入本地 JSON 的 checkpoint 元数据。"""
+    data_offset = min(
+        plan.data_offset + (global_step - plan.resume_step) * args.batch_size,
+        num_questions,
+    )
+    return {
+        "run_name": args.save_name,
+        "checkpoint_step": global_step,
+        "data_offset": data_offset,
+        "batch_size": args.batch_size,
+        "group_size": args.group_size,
+        "seed": args.seed,
+        "num_questions": num_questions,
+        "questions_sha256": plan.questions_sha256,
+    }
 
 
 def load_local_tokenizer(model_id: str):
@@ -182,6 +344,17 @@ def build_prompt_tokens(tokenizer, question: str) -> list[int]:
     if not prompt_ids:
         raise ValueError("Prompt tokens are empty")
     return prompt_ids
+
+
+def ensure_tokenizers_aligned(student_tokenizer, teacher_tokenizer) -> None:
+    """teacher 接收 student token ID，必须校验完整词表和特殊 token 配置。"""
+    if (
+        student_tokenizer.get_vocab() != teacher_tokenizer.get_vocab()
+        or student_tokenizer.special_tokens_map != teacher_tokenizer.special_tokens_map
+    ):
+        raise ValueError(
+            "Teacher and student tokenizers disagree; token ids cannot be aligned"
+        )
 
 
 def completion_teacher_logprobs(
@@ -279,7 +452,7 @@ def run_prompt_rollout(
             completion_ids=completion_ids,
         )
         reverse_kl = np.asarray(student_logprobs) - np.asarray(teacher_logprobs)
-        advantages = -args.kl_penalty_coef * reverse_kl
+        advantages = -reverse_kl
 
         datums.append(
             build_opd_datum(
@@ -297,13 +470,29 @@ def run_prompt_rollout(
     return datums, reverse_kls, completion_token_counts, hit_max_tokens
 
 
-def save_checkpoint(training_client, name: str) -> tuple[str, str]:
-    """同时保存可续训的 state 和可推理的 sampler 权重。"""
+def save_checkpoint(
+    training_client,
+    name: str,
+    metadata: dict,
+) -> None:
+    """同时保存可续训的 state、可推理的 sampler 权重和本地元数据。"""
     state = training_client.save_state(name=f"{name}-state").result()
     weights = training_client.save_weights_for_sampler(name=f"{name}-weights").result()
     tqdm.write(f"Saved state [{name}]: {state.path}")
     tqdm.write(f"Saved sampler weights [{name}]: {weights.path}")
-    return state.path, weights.path
+    payload = {
+        **metadata,
+        "checkpoint_name": name,
+        "state_uri": state.path,
+        "weights_uri": weights.path,
+    }
+    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+    metadata_path = CHECKPOINTS_DIR / f"{name}.json"
+    metadata_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tqdm.write(f"Saved checkpoint metadata [{name}]: {metadata_path}")
 
 
 def raise_keyboard_interrupt(signum, frame) -> None:
@@ -311,18 +500,21 @@ def raise_keyboard_interrupt(signum, frame) -> None:
     raise KeyboardInterrupt(f"received signal {signum}")
 
 
-def start_swanlab(args: argparse.Namespace, dataset_size: int, total_steps: int):
+def start_swanlab(args: argparse.Namespace, dataset_size: int, plan: RunPlan):
     if not args.swanlab:
         return None
     import swanlab
 
     config = vars(args).copy()
     config["dataset_size"] = dataset_size
-    config["total_steps"] = total_steps
+    config["total_steps"] = plan.end_step
+    config["resume_step"] = plan.resume_step
+    config["data_offset"] = plan.data_offset
+    config["steps_to_run"] = plan.steps_to_run
+    config["metadata_found"] = plan.metadata_found
     return swanlab.init(
-        project=args.swanlab_project,
+        project="agentic-rl-lab-opd",
         name=args.save_name,
-        mode=args.swanlab_mode,
         config=config,
         tags=["PyTRIO", "OPD", "GSM8K", "Qwen3.5-4B", "Qwen3.8-27B"],
         log_dir=str(Path(__file__).resolve().parent / "swanlog"),
@@ -335,49 +527,49 @@ def train_one_epoch(
     tokenizer,
     questions: list[str],
     args: argparse.Namespace,
+    plan: RunPlan,
     swanlab_run=None,
-) -> tuple[int, int, int]:
-    """跑一个 epoch（或前 --max-steps 步）。
+) -> tuple[int, int]:
+    """跑 RunPlan 指定的全局 step 范围。
 
     Returns:
-        (实际运行步数, 一个 epoch 总步数, 累计 completion token 数)
+        (实际运行步数, 累计 completion token 数)
     """
-    steps_per_epoch = (len(questions) + args.batch_size - 1) // args.batch_size
-    steps_to_run = (
-        steps_per_epoch if args.max_steps == 0 else min(args.max_steps, steps_per_epoch)
-    )
-    if steps_to_run < steps_per_epoch:
-        print(f"Running {steps_to_run}/{steps_per_epoch} steps (--max-steps)")
-
     adam = trio.AdamParams(
         learning_rate=args.learning_rate,
-        beta1=args.beta1,
-        beta2=args.beta2,
+        beta1=0.9,
+        beta2=0.95,
     )
     stop = list(dict.fromkeys(t for t in (tokenizer.eos_token, "<|im_end|>") if t))
     sampling_params = trio.SamplingParams(
         max_tokens=args.max_tokens,
         seed=args.seed,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
         stop=stop,
     )
 
-    student_sampler = None
     completed_steps = 0
-    last_saved_step = 0
+    update_pending = False
+    last_saved_step = plan.resume_step
     total_completion_tokens = 0
-    progress = tqdm(range(steps_to_run), desc="OPD epoch 1", unit="step")
+    progress = tqdm(
+        range(plan.steps_to_run),
+        desc=f"OPD step {plan.resume_step + 1}-{plan.end_step}",
+        unit="step",
+    )
 
     try:
-        for step in progress:
+        for local_step in progress:
             step_start = time.time()
-            if student_sampler is None or step % args.sampler_refresh_steps == 0:
-                student_sampler = training_client.save_weights_and_get_sampling_client()
+            global_step = plan.resume_step + local_step + 1
+            student_sampler = training_client.save_weights_and_get_sampling_client()
 
-            start = step * args.batch_size
+            start = plan.data_offset + local_step * args.batch_size
             batch = questions[start : start + args.batch_size]
+            if not batch:
+                raise RuntimeError(f"No prompts at data offset {start}")
             datums: list[trio.Datum] = []
             reverse_kls: list[float] = []
             completion_token_counts: list[int] = []
@@ -399,8 +591,12 @@ def train_one_epoch(
                 hit_max_tokens += prompt_hit_max
 
             if not datums:
-                raise RuntimeError("No OPD datums were built; all completions were empty")
+                raise RuntimeError(
+                    "No OPD datums were built; all completions were empty"
+                )
 
+            # 从提交开始到本地确认完成，远端状态可能已改变，异常时不能标记为旧 step。
+            update_pending = True
             fwd_bwd_future = training_client.forward_backward(
                 datums,
                 loss_fn="importance_sampling",
@@ -408,7 +604,8 @@ def train_one_epoch(
             optim_future = training_client.optim_step(adam)
             fwd_bwd_result = fwd_bwd_future.result()
             optim_future.result()
-            completed_steps = step + 1
+            completed_steps = local_step + 1
+            update_pending = False
 
             elapsed = time.time() - step_start
             completion_tokens_total = int(sum(completion_token_counts))
@@ -433,41 +630,61 @@ def train_one_epoch(
             if swanlab_run is not None:
                 import swanlab
 
-                swanlab.log(metrics, step=completed_steps)
+                swanlab.log(metrics, step=global_step)
 
             loss_mean = float(fwd_bwd_result.metrics.get("loss_mean", 0.0))
             progress.set_postfix(
+                step=f"{global_step}/{plan.end_step}",
                 reverse_kl=f"{metrics['opd/reverse_kl_mean']:.4f}",
                 loss=f"{loss_mean:.4f}",
                 tokens=completion_tokens_total,
             )
 
-            if args.save_every > 0 and completed_steps % args.save_every == 0:
+            if (
+                args.save_every > 0
+                and global_step % args.save_every == 0
+                and global_step < plan.end_step
+            ):
                 save_checkpoint(
                     training_client,
-                    f"{args.save_name}-step-{completed_steps}",
+                    f"{args.save_name}-step-{global_step}",
+                    metadata=build_checkpoint_metadata(
+                        args, plan, len(questions), global_step
+                    ),
                 )
-                last_saved_step = completed_steps
+                last_saved_step = global_step
     except BaseException as error:
-        # 异常 / Ctrl+C / SIGTERM：保存最后一个完整 step 之后的进度再退出。
         progress.close()
-        print(f"OPD interrupted after {completed_steps} steps: {error!r}")
-        if completed_steps > last_saved_step:
+        global_step = plan.resume_step + completed_steps
+        print(
+            f"OPD interrupted after {completed_steps} steps "
+            f"(global step {global_step}): {error!r}"
+        )
+        if update_pending:
+            print(
+                "Remote update status is uncertain; skipping interrupted checkpoint. "
+                f"Resume from the last reliable checkpoint (step {last_saved_step}), "
+                "or restart if none exists."
+            )
+        elif global_step > last_saved_step:
             try:
                 save_checkpoint(
                     training_client,
-                    f"{args.save_name}-interrupted-step-{completed_steps}",
+                    f"{args.save_name}-interrupted-step-{global_step}",
+                    metadata=build_checkpoint_metadata(
+                        args, plan, len(questions), global_step
+                    ),
                 )
             except Exception as save_error:  # noqa: BLE001 - 保存失败不应掩盖原始异常
                 print(f"Failed to save interrupted checkpoint: {save_error!r}")
         raise
 
-    return steps_to_run, steps_per_epoch, total_completion_tokens
+    return completed_steps, total_completion_tokens
 
 
 def ensure_models_available(
     service_client,
-    student_model: str,
+    student_model: str | None,
     teacher_model: str,
 ) -> None:
     """创建 client 前检查模型目录和 runner 可用性，避免 remote 404。"""
@@ -492,27 +709,35 @@ def ensure_models_available(
             )
 
 
-def dry_run(args: argparse.Namespace, questions: list[str]) -> None:
-    """只做本地统计：prompt 长度、step 数、rollout 数。"""
+def dry_run(
+    args: argparse.Namespace,
+    questions: list[str],
+    plan: RunPlan,
+) -> None:
+    """只做本地统计：prompt 长度、step 范围、rollout 数。"""
     tokenizer = load_local_tokenizer(args.base_model)
     lengths = [
         len(build_prompt_tokens(tokenizer, question))
         for question in tqdm(questions, desc="Tokenizing", unit="prompt")
     ]
-    steps_per_epoch = (len(questions) + args.batch_size - 1) // args.batch_size
     rollouts_per_step = args.batch_size * args.group_size
     print(f"Usable prompts: {len(questions)}")
+    print(
+        f"Resume: step={plan.resume_step}, "
+        f"data_offset={plan.data_offset}/{len(questions)}, "
+        f"metadata_found={plan.metadata_found}"
+    )
+    print(
+        f"Run plan: {plan.steps_to_run} steps, "
+        f"global {plan.resume_step + 1}..{plan.end_step}, "
+        f"{rollouts_per_step} rollouts/step"
+    )
     print(
         f"Prompt tokens: mean={np.mean(lengths):.1f}, "
         f"max={max(lengths)}, min={min(lengths)}"
     )
     print(
-        f"One epoch @ batch_size={args.batch_size}: {steps_per_epoch} steps, "
-        f"{rollouts_per_step} rollouts/step, "
-        f"{len(questions) * args.group_size} rollouts total"
-    )
-    print(
-        f"Every rollout: 1 student sample + 1 teacher compute_logprobs, "
+        f"Each prompt: 1 student sample request + up to {args.group_size} teacher requests, "
         f"max_tokens={args.max_tokens}"
     )
 
@@ -521,19 +746,18 @@ def main() -> None:
     args = parse_args()
     questions = load_gsm8k_questions(args.train_file)
     random.Random(args.seed).shuffle(questions)
+    questions_sha256 = sha256_of_questions(questions)
     print(f"Loaded {len(questions)} GSM8K training prompts")
 
+    plan = resolve_run_plan(args, questions, questions_sha256)
+
     if args.dry_run:
-        dry_run(args, questions)
+        dry_run(args, questions, plan)
         return
 
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
 
-    steps_per_epoch = (len(questions) + args.batch_size - 1) // args.batch_size
-    total_steps = (
-        steps_per_epoch if args.max_steps == 0 else min(args.max_steps, steps_per_epoch)
-    )
-    swanlab_run = start_swanlab(args, len(questions), total_steps)
+    swanlab_run = start_swanlab(args, len(questions), plan)
 
     try:
         service_client = trio.ServiceClient()
@@ -544,8 +768,10 @@ def main() -> None:
         )
         if args.resume_from:
             print(f"Resuming student from state: {args.resume_from}")
-            training_client = service_client.create_training_client_from_state_with_optimizer(
-                args.resume_from
+            training_client = (
+                service_client.create_training_client_from_state_with_optimizer(
+                    args.resume_from
+                )
             )
         else:
             training_client = service_client.create_lora_training_client(
@@ -555,52 +781,43 @@ def main() -> None:
             )
         teacher_client = service_client.create_sampling_client(
             base_model=args.teacher_base_model,
-            model_path=args.teacher_model_path,
         )
         tokenizer = training_client.get_tokenizer()
 
-        # student 和 teacher 的 token id 必须逐 token 对齐，否则 teacher logprob
-        # 会悄悄对应到不同的 token，训练信号完全错误。
-        teacher_tokenizer = teacher_client.get_tokenizer()
-        probe = "PyTRIO OPD tokenizer alignment check"
-        if teacher_tokenizer.encode(probe, add_special_tokens=False) != tokenizer.encode(
-            probe, add_special_tokens=False
-        ):
-            raise ValueError(
-                "Teacher and student tokenizers disagree; token ids cannot be aligned"
-            )
+        ensure_tokenizers_aligned(tokenizer, teacher_client.get_tokenizer())
 
         if args.resume_from:
             print(f"Student: resumed from {args.resume_from}")
         else:
             print(f"Student: {args.base_model} (LoRA rank {args.rank})")
+        print(f"Teacher: {args.teacher_base_model} (base model)")
         print(
-            f"Teacher: {args.teacher_base_model}"
-            + (
-                f" @ {args.teacher_model_path}"
-                if args.teacher_model_path
-                else " (base model)"
-            )
-        )
-        print(
-            f"Training: {total_steps} steps, batch={args.batch_size} prompts, "
+            f"Training: global steps {plan.resume_step + 1}..{plan.end_step} "
+            f"({plan.steps_to_run} steps), batch={args.batch_size} prompts, "
             f"group={args.group_size} completions/prompt"
         )
 
-        steps_run, steps_total, total_tokens = train_one_epoch(
+        steps_run, total_tokens = train_one_epoch(
             training_client=training_client,
             teacher_client=teacher_client,
             tokenizer=tokenizer,
             questions=questions,
             args=args,
+            plan=plan,
             swanlab_run=swanlab_run,
         )
+        final_step = plan.resume_step + steps_run
         print(
-            f"OPD finished | ran {steps_run}/{steps_total} steps | "
+            f"OPD finished | ran {steps_run} steps "
+            f"(global {plan.resume_step + 1}..{final_step}) | "
             f"total completion tokens={total_tokens}"
         )
 
-        save_checkpoint(training_client, f"{args.save_name}-final")
+        save_checkpoint(
+            training_client,
+            f"{args.save_name}-final",
+            metadata=build_checkpoint_metadata(args, plan, len(questions), final_step),
+        )
     finally:
         if swanlab_run is not None:
             import swanlab
